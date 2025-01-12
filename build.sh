@@ -10,3 +10,12 @@ cmake -GNinja -Bbuild \
   -DTORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS=ON \
   -DTORCH_MLIR_ENABLE_JIT_IR_IMPORTER=ON \
   externals/llvm-project/llvm
+
+# Build just torch-mlir (not all of LLVM)
+cmake --build build --target tools/torch-mlir/all
+
+# Run unit tests.
+cmake --build build --target check-torch-mlir
+
+# Run Python regression tests.
+cmake --build build --target check-torch-mlir-python
