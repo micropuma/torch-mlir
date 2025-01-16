@@ -1,11 +1,10 @@
 mlir-opt output-origin.mlir \
   --canonicalize \
   --eliminate-empty-tensors \
-  --empty-tensor-to-alloc-tensor \
   -o output1.mlir
 
 mlir-opt output1.mlir \
-  --one-shot-bufferize \
+  --one-shot-bufferize="bufferize-function-boundaries" \
   -o output2.mlir
 
 mlir-opt output2.mlir \

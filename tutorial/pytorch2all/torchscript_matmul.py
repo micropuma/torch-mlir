@@ -11,7 +11,7 @@ class LargeMatrixMultiplication(torch.nn.Module):
         return torch.matmul(A, B)
 
 # 创建大矩阵数据
-matrix_size = 1024  # 矩阵大小 1024x1024
+matrix_size = 2  # 矩阵大小 1024x1024
 A = torch.from_numpy(np.random.rand(matrix_size, matrix_size).astype(np.float32))
 B = torch.from_numpy(np.random.rand(matrix_size, matrix_size).astype(np.float32))
 
