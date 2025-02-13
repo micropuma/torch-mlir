@@ -122,6 +122,8 @@ void mlir::torch::Torch::createTorchOnnxToTorchBackendPipeline(
   }
 }
 
+// Torch-mlir debug:
+// 这个pass是从前端到contract的核心pipeline。
 // A simplification pipeline to establish the invariants of the backend
 // contract (see `satisfiedBackendContract` in `LowerToBackendContract`).
 //
