@@ -13,8 +13,10 @@ resnet18.eval()
 
 module = torchscript.compile(resnet18, torch.ones(1, 3, 224, 224), output_type="torch")
 print("TORCH OutputType\n", module.operation.get_asm(large_elements_limit=10))
+
+# output_type can be: TORCH, TOSA, LINALG_ON_TENSORS, RAW and STABLEHLO.
 module = torchscript.compile(
-    resnet18, torch.ones(1, 3, 224, 224), output_type="linalg-on-tensors"
+    resnet18, torch.ones(1, 3, 224, 224), output_type="STABLEHLO"
 )
 
 with open("output.mlir", "w") as file:
