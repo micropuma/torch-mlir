@@ -25,21 +25,31 @@ using namespace mlir;
 using namespace mlir::torch;
 using namespace mlir::torch::Torch;
 
+/// torch-mlir的机制是，将PyTorch通过torch-script或是lazytensor转换为Torch的IR，
+/// 然后将torch ir转换为合约ir。
+/// 目前已支持的ir诸如tosa ir，stableHLO ir等，都支持从contraction ir转换而来。
+
 //===----------------------------------------------------------------------===//
 // Checking the backend contract.
+// 类型检查: 验证所有值类型符合后端要求（如静态形状、确定的数据类型等）。
+// Pass管道迭代: 多次运行优化管道，逐步消除不符合后端契约的代码模式。
+// 错误处理: 在超过最大迭代次数后输出诊断信息，帮助定位问题。
 //===----------------------------------------------------------------------===//
 
 static void markDecomposedOpsAsIllegal(MLIRContext *context,
                                        ConversionTarget &target,
                                        llvm::StringSet<> backendLegalOps);
 
+/// 检查给定类型是否符合后端契约
 static LogicalResult checkType(Operation *op, Type type,
                                bool actuallyEmitDiagnostics) {
   // Allow various scalar types that backends are expected to be able to handle.
+  // 基础type，后端默认能够处理
   if (isa<Torch::IntType, Torch::FloatType, Torch::BoolType, Torch::DeviceType>(
           type))
     return success();
 
+  // 这两种类型不支持动态，允许后端进行静态匹配，用optional<>类型来表示。
   // Backends are not expected to support dynamic computations on these types,
   // but they frequently appear as parameters to ops which backends
   // can statically pattern match and eliminate from the program.
@@ -52,6 +62,9 @@ static LogicalResult checkType(Operation *op, Type type,
   // All of our backends are currently based on value-semantic tensors, so
   // we consider it our responsibility to lower all non-value-semantic tensors
   // to value-semantic tensors.
+  // 对于non-value semantics，默认后端都是基于value semantics展开的（tensor 表示就是一个值表示）。
+  // 因此到contract的时候，我们需要确保所有的tensor都是value semantics的。
+  // 将non-value semantics转换为value semantics，是在torch-mlir的项目中的MaximizeValueSemantics完成的。
   if (isa<NonValueTensorType>(type)) {
     if (actuallyEmitDiagnostics) {
       return op
@@ -64,6 +77,10 @@ static LogicalResult checkType(Operation *op, Type type,
     }
   }
 
+  // 对于value semantics的tensor，我们需要确保rank和dtype是已知的。
+  // 对于rank未知的tensor，我们不知道后端如何处理。
+  // 因此torch-mlir认定，rank等的处理必须在codegen之前，在
+  // torch-mlir内部完成。
   // For value-semantic tensors, we require at least a known rank and dtype.
   // We are not aware of a situation where our backends can handle an unranked
   // tensor type or a tensor with a dynamic dtype.
@@ -83,6 +100,10 @@ static LogicalResult checkType(Operation *op, Type type,
   // have an sufficiently rich system for representing PyTorch type promotion
   // rules. So we consider it our responsibility to ensure that all dtypes are
   // statically known.
+
+  // torch-mlir的type system的写法是十分值得学习的！！！
+  // ValueTensorType有两个属性：shape和dtype，这两个属性都是已知的。
+  // 通过hasSizes()和hasDtype()来判断是否已知。
   if (auto tensorType = dyn_cast<ValueTensorType>(type)) {
     if (!tensorType.hasSizes()) {
       if (actuallyEmitDiagnostics) {
@@ -122,6 +143,10 @@ static LogicalResult checkType(Operation *op, Type type,
     return checkType(op, optionalType.getContainedType(),
                      actuallyEmitDiagnostics);
   }
+
+  // list ops后端也是没法处理的，但是在表示pytorch code的时候有必须存在：
+  // 比如卷积操作的strides就是一个list。
+  // 因此需要做转换。
   // List types are also in the category of types which we don't expect
   // backends to dynamically compute with, but they can be pattern matched
   // in many cases that are practically necessary. For example, the
@@ -133,6 +158,8 @@ static LogicalResult checkType(Operation *op, Type type,
     // the contained type information. Somehow this slips through and works.
     // We should be stricter about this and properly infer the contained type
     // and shape.
+    // 如果list type的contained type是tensor，那么就是符合后端要求的。
+    // 否则，针对list type里面存储的type，进行checktype。
     if (isa<ValueTensorType>(listType.getContainedType()))
       return success();
     return checkType(op, listType.getContainedType(), actuallyEmitDiagnostics);
@@ -140,6 +167,7 @@ static LogicalResult checkType(Operation *op, Type type,
   // Tuple types are also in the category of types which we don't expect
   // backends to dynamically compute with, but they can be pattern matched
   // in many cases that are practically necessary.
+  // 和list type一样的处理方式。
   if (auto tupleType = dyn_cast<Torch::TupleType>(type)) {
     for (auto containedType : tupleType.getContainedTypes()) {
       if (failed(checkType(op, containedType, actuallyEmitDiagnostics)))
@@ -172,9 +200,12 @@ static LogicalResult checkOpIsBackendLegal(Operation *op,
   }
 }
 
+/// 这个pass的核心逻辑所在
+/// 基于上面的checkType，对于所有的invalid type，做contract化。
 static bool satisfiesBackendContract(ModuleOp module,
                                      const ConversionTarget &target,
                                      bool actuallyEmitDiagnostics = false) {
+  // 查找GlobalSlotModuleInitializerOp，若存在则报错。
   // We do not permit `torch.global_slot`'s in the backend contract, since
   // support for them is not widespread, and this does not align with PyTorch's
   // more tracing-based direction.
@@ -223,12 +254,18 @@ static bool satisfiesBackendContract(ModuleOp module,
   // A pre-order walk gives a more intuitive "first error".
   // TODO: Should we report more than the first error?
   // How do we avoid making it too spammy?
+  // 全面检查：
+  // 块参数 (Block Arguments): 检查每个块的输入参数类型。
+  // 操作结果 (Op Results): 检查每个操作输出结果的类型。
+  // 遍历顺序: 使用PreOrder遍历，优先检查父操作，便于尽早发现错误。
   auto walkResult1 = module.walk<WalkOrder::PreOrder>([&](Block *block) {
     for (BlockArgument arg : block->getArguments())
       if (failed(checkType(block->getParentOp(), arg.getType(),
                            actuallyEmitDiagnostics))) {
         return WalkResult::interrupt();
       }
+
+    // 这部分是该op有没有标记为legal
     for (Operation &op : *block) {
       if (failed(checkOpIsBackendLegal(&op, target, actuallyEmitDiagnostics)))
         return WalkResult::interrupt();
@@ -249,13 +286,16 @@ static bool satisfiesBackendContract(ModuleOp module,
 static ConversionTarget
 getBackendContractTarget(MLIRContext *context, bool decompose,
                          llvm::StringSet<> backendLegalOpsSet) {
+  // 设立legal dialect
   ConversionTarget target(*context);
   target.addLegalDialect<func::FuncDialect, Torch::TorchDialect>();
   if (decompose)
+    // 将所有的符合操作标记为illegal
     markDecomposedOpsAsIllegal(context, target, backendLegalOpsSet);
   return target;
 }
 
+// todo：Torch-mlir debug
 namespace {
 class LowerToBackendContractPass
     : public LowerToBackendContractBase<LowerToBackendContractPass> {
@@ -286,8 +326,16 @@ public:
     options.shapeDtypeRefine = shapeDtypeRefine;
     options.backendLegalOps = backendLegalOps;
     options.extraLibrary = extraLibrary;
+
+    // 这个pm pipeline使整个contract 化的核心。
+    // Torch-mlir debug here:
+    /// Creates a pipeline that simplifies the computations in the program.
+    /// This pass does not do any global program restructuring -- it works entirely
+    /// within a single semantic model of a `builtin.module` with
+    /// `torch.global_slot` ops and `func.func` ops.
     createTorchSimplificationPipeline(pm, options);
 
+    // 多轮迭代，直到全部contract化
     int i = 0;
     do {
       if (i++ == maxIterations) {
@@ -336,6 +384,8 @@ public:
 };
 } // namespace
 
+// 十分简洁的c++ code写法
+// 工厂方法。
 std::unique_ptr<OperationPass<ModuleOp>>
 mlir::torch::Torch::createLowerToBackendContractPass(
     int maxIterations, bool decompose, bool shapeDtypeRefine,
@@ -350,6 +400,8 @@ mlir::torch::Torch::createVerifyBackendContractNoDecompositionsPass() {
   return std::make_unique<VerifyBackendContractNoDecompositionsPass>();
 }
 
+// 用于标记 MLIR 计算图 中 需要分解（decompose）的算子 为 非法（illegal），
+// 以确保它们在 LowerToBackendContractPass 过程中被正确处理。
 // The backend contract guarantees that ops with decompositions available will
 // be decomposed. The only way to have an op reach the backend contract without
 // getting decomposed is by having the user explicitly specify that op in the
@@ -572,6 +624,7 @@ static void markDecomposedOpsAsIllegal(MLIRContext *context,
   target.addIllegalOp<AtenFmaxOp>();
   target.addIllegalOp<AtenSpecialExpm1Op>();
 
+  // 这个backendLegalOpsSet是用户显示指定的合法Ops。
   for (auto &opName : backendLegalOpsSet) {
     target.addLegalOp(
         OperationName(kTorchOpPrefix + opName.first().str(), context));
